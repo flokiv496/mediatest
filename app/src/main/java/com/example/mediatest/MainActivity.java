@@ -10,6 +10,9 @@ import android.content.res.Resources;
 import android.content.res.XmlResourceParser;
 import org.xmlpull.v1.XmlPullParser;
 import java.io.File;
+import java.io.FileWriter;
+import java.util.Enumeration;
+import java.util.regex.Pattern;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -52,6 +55,7 @@ public class MainActivity extends Activity {
     private Button btnSel;
     private long ownPos = 0;
     private String lastTitle = "";
+    private long updAtChange = -1;
 
     private final Runnable ticker = new Runnable() {
         @Override
@@ -183,6 +187,20 @@ public class MainActivity extends Activity {
         row2.addView(btn("4. TW: поиск TWUtil", new View.OnClickListener() {
             public void onClick(View v) { appsList = "\n" + probeTw(); refresh(); }
         }));
+        row2.addView(btn("5. TW: классы com.tw.bt", new View.OnClickListener() {
+            public void onClick(View v) {
+                appsList = "\nСканирую классы com.tw.bt, подождите...\n";
+                refresh();
+                new Thread(new Runnable() {
+                    public void run() {
+                        final String r = dumpClasses("com.tw.bt");
+                        handler.post(new Runnable() {
+                            public void run() { appsList = "\n" + r; refresh(); }
+                        });
+                    }
+                }).start();
+            }
+        }));
         root.addView(row2);
         tvStatus = text(14, 0xFFFFD60A);
         root.addView(tvStatus);
@@ -200,26 +218,15 @@ public class MainActivity extends Activity {
     }
 
     private void doPrev() {
-        if (current == null) { status("Нет активной сессии"); return; }
-        current.getTransportControls().skipToPrevious();
-        status("Отправлено skipToPrevious -> " + current.getPackageName() + " [сессия " + indexOf(current) + "]");
+        sendKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS, "назад");
     }
 
     private void doNext() {
-        if (current == null) { status("Нет активной сессии"); return; }
-        current.getTransportControls().skipToNext();
-        status("Отправлено skipToNext -> " + current.getPackageName() + " [сессия " + indexOf(current) + "]");
+        sendKey(KeyEvent.KEYCODE_MEDIA_NEXT, "вперёд");
     }
 
     private void doPlayPause() {
-        if (current == null) { status("Нет активной сессии"); return; }
-        if (isPlaying(current)) {
-            current.getTransportControls().pause();
-            status("Отправлено pause -> сессия " + indexOf(current));
-        } else {
-            current.getTransportControls().play();
-            status("Отправлено play -> сессия " + indexOf(current));
-        }
+        sendKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, "пуск/пауза");
     }
 
     private int indexOf(MediaController c) {
@@ -314,6 +321,65 @@ public class MainActivity extends Activity {
         return sb.toString();
     }
 
+    @SuppressWarnings("deprecation")
+    private String dumpClasses(String pkg) {
+        StringBuilder screen = new StringBuilder();
+        StringBuilder full = new StringBuilder();
+        int n = 0, shown = 0;
+        try {
+            Context c = createPackageContext(pkg, Context.CONTEXT_INCLUDE_CODE | Context.CONTEXT_IGNORE_SECURITY);
+            ClassLoader cl = c.getClassLoader();
+            String apk = getPackageManager().getApplicationInfo(pkg, 0).sourceDir;
+            dalvik.system.DexFile df = new dalvik.system.DexFile(apk);
+            Pattern p = Pattern.compile("(?i)next|prev|play|pause|music|a2dp|avrcp|track|song|media|cmd");
+            Enumeration<String> en = df.entries();
+            while (en.hasMoreElements()) {
+                String cn = en.nextElement();
+                if (!cn.startsWith("com.tw.")) continue;
+                n++;
+                String sn = cn.substring(cn.lastIndexOf('.') + 1);
+                full.append(cn).append("\n");
+                try {
+                    Class<?> k = Class.forName(cn, false, cl);
+                    for (Field f : k.getDeclaredFields()) {
+                        String line;
+                        if (Modifier.isStatic(f.getModifiers()) && (f.getType() == int.class || f.getType() == String.class)) {
+                            f.setAccessible(true);
+                            line = "F " + f.getName() + "=" + f.get(null);
+                        } else {
+                            line = "f " + f.getName();
+                        }
+                        full.append("  ").append(line).append("\n");
+                        if (shown < 90 && p.matcher(f.getName()).find()) {
+                            screen.append(sn).append(": ").append(line).append("\n");
+                            shown++;
+                        }
+                    }
+                    for (Method m : k.getDeclaredMethods()) {
+                        full.append("  m ").append(m.getName()).append("\n");
+                        if (shown < 90 && p.matcher(m.getName()).find()) {
+                            screen.append(sn).append(": m ").append(m.getName()).append("\n");
+                            shown++;
+                        }
+                    }
+                } catch (Throwable t) {
+                    full.append("  ERR ").append(t.getClass().getSimpleName()).append("\n");
+                }
+            }
+        } catch (Throwable e) {
+            return "Ошибка сканирования: " + e + "\n";
+        }
+        String path = "не удалось сохранить";
+        try {
+            File out = new File(getExternalFilesDir(null), "twbt_dump.txt");
+            FileWriter w = new FileWriter(out);
+            w.write(full.toString());
+            w.close();
+            path = out.getAbsolutePath();
+        } catch (Throwable ignore) {}
+        return "Классов com.tw.: " + n + "\nПолный файл: " + path + "\n" + screen;
+    }
+
     private boolean hasAccess() {
         String flat = Settings.Secure.getString(getContentResolver(), "enabled_notification_listeners");
         return flat != null && flat.contains(getPackageName());
@@ -404,14 +470,19 @@ public class MainActivity extends Activity {
             long pos = 0;
             String lp = "";
             String curTitle = title == null ? "" : title;
-            if (!curTitle.equals(lastTitle)) { lastTitle = curTitle; ownPos = 0; }
+            if (!curTitle.equals(lastTitle)) {
+                // трек сменился: позицию от плеера не верим, пока он не обновит состояние
+                updAtChange = (!lastTitle.isEmpty() && ps != null) ? ps.getLastPositionUpdateTime() : -1;
+                lastTitle = curTitle;
+                ownPos = 0;
+            }
             boolean reliable = false;
             if (ps != null) {
                 long raw = ps.getPosition();
                 long upd = ps.getLastPositionUpdateTime();
                 long now = SystemClock.elapsedRealtime();
                 lp = " поз=" + raw + " upd=" + upd + " v=" + ps.getPlaybackSpeed();
-                if (raw >= 0 && upd > 0 && upd <= now && !(dur > 0 && raw >= dur - 1500 && ps.getState() == PlaybackState.STATE_PLAYING)) {
+                if (raw >= 0 && upd > 0 && upd <= now && upd != updAtChange && !(dur > 0 && raw >= dur - 1500 && ps.getState() == PlaybackState.STATE_PLAYING)) {
                     pos = raw;
                     if (ps.getState() == PlaybackState.STATE_PLAYING) {
                         float sp = ps.getPlaybackSpeed();
